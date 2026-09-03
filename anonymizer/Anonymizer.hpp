@@ -41,13 +41,12 @@ private:
     std::vector<size_t> m_sigma;
     cv::Mat m_ycbcr_roi;
     cv::Mat m_flattened_ycbcr;
-    cv::Mat m_permuted_pixels;
     cv::Mat m_output_roi;
     
-    // Zigzag lookup table (LUT) for macroblock mapping
-    // Maps a 1D sorted index to a 1D offset in the macroblock (y * size + x)
+    // Zigzag lookup table (LUT) for block grid mapping.
+    // zigzag_lut[b] = position in the block grid where sorted block b is placed.
     std::vector<int> m_zigzag_lut;
 
-    void initializeZigzagLut();
+    void initializeZigzagLut(int grid_rows, int grid_cols);
     void calibrate(const cv::Mat& flattened_ycbcr);
 };

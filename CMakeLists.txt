@@ -12,8 +12,8 @@ include_directories(${OpenCV_INCLUDE_DIRS})
 
 # Definir el ejecutable de prueba con todas sus fuentes
 add_executable(test_anonymizer 
-    test_anonymizer.cpp 
-    Anonymizer.cpp
+    tests/test_anonymizer.cpp 
+    anonymizer/Anonymizer.cpp
 )
 
 # Enlazar con OpenCV

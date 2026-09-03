@@ -3,7 +3,6 @@
 #include <numeric>
 #include <algorithm>
 #include <stdexcept>
-#include <tuple>
 
 Anonymizer::Anonymizer(int macroblock_size)
     : m_macroblock_size(macroblock_size),
@@ -14,21 +13,20 @@ Anonymizer::Anonymizer(int macroblock_size)
     if (m_macroblock_size <= 0) {
         throw std::invalid_argument("Macroblock size must be greater than 0");
     }
-    initializeZigzagLut();
 }
 
-void Anonymizer::initializeZigzagLut() {
-    int n = m_macroblock_size;
-    m_zigzag_lut.resize(n * n);
-    
+void Anonymizer::initializeZigzagLut(int grid_rows, int grid_cols) {
+    int total = grid_rows * grid_cols;
+    m_zigzag_lut.resize(total);
+
     int row = 0, col = 0;
     bool going_up = true;
-    
-    for (int i = 0; i < n * n; ++i) {
-        m_zigzag_lut[i] = row * n + col;
-        
+
+    for (int i = 0; i < total; ++i) {
+        m_zigzag_lut[i] = row * grid_cols + col;
+
         if (going_up) {
-            if (col == n - 1) {
+            if (col == grid_cols - 1) {
                 row++;
                 going_up = false;
             } else if (row == 0) {
@@ -39,7 +37,7 @@ void Anonymizer::initializeZigzagLut() {
                 col++;
             }
         } else {
-            if (row == n - 1) {
+            if (row == grid_rows - 1) {
                 col++;
                 going_up = true;
             } else if (col == 0) {
@@ -56,7 +54,9 @@ void Anonymizer::initializeZigzagLut() {
 void Anonymizer::reset() {
     m_is_calibrated = false;
     m_sigma.clear();
+    m_zigzag_lut.clear();
     m_last_size = cv::Size(0, 0);
+    m_last_type = -1;
 }
 
 bool Anonymizer::isCalibrated() const {
@@ -103,11 +103,15 @@ cv::Mat Anonymizer::processFrame(const cv::Mat& input_roi) {
         throw std::invalid_argument("Input ROI dimensions must be exact multiples of macroblock size");
     }
     
-    // Check if recalibration is needed due to size or type changes
+    // Recalibrate and recompute grid LUT only when size or type changes
     if (input_roi.size() != m_last_size || input_roi.type() != m_last_type) {
         reset();
         m_last_size = input_roi.size();
         m_last_type = input_roi.type();
+
+        int B_x = input_roi.cols / m_macroblock_size;
+        int B_y = input_roi.rows / m_macroblock_size;
+        initializeZigzagLut(B_y, B_x);
     }
     
     // Convert to YCrCb space
@@ -122,16 +126,7 @@ cv::Mat Anonymizer::processFrame(const cv::Mat& input_roi) {
         calibrate(m_flattened_ycbcr);
     }
     
-    // Permute pixels according to sigma vector (S[i] = F[sigma[i]])
-    m_permuted_pixels.create(n_pixels, 1, CV_8UC3);
-    const auto* src_data = m_flattened_ycbcr.ptr<cv::Vec3b>(0);
-    auto* dst_data = m_permuted_pixels.ptr<cv::Vec3b>(0);
-    
-    for (size_t i = 0; i < (size_t)n_pixels; ++i) {
-        dst_data[i] = src_data[m_sigma[i]];
-    }
-    
-    // Reorganize into Macroblocks with Zigzag scan
+    // Reorganize into Macroblocks with Zigzag Assembly
     m_output_roi.create(input_roi.rows, input_roi.cols, CV_8UC3);
     
     int B_x = input_roi.cols / m_macroblock_size;
@@ -140,26 +135,27 @@ cv::Mat Anonymizer::processFrame(const cv::Mat& input_roi) {
     
     int out_step = m_output_roi.step1() / 3; // Step in pixels
     auto* out_data = m_output_roi.ptr<cv::Vec3b>(0);
-    
-    size_t permuted_idx = 0;
-    
-    for (int by = 0; by < B_y; ++by) {
-        int block_start_y = by * m_macroblock_size;
-        for (int bx = 0; bx < B_x; ++bx) {
-            int block_start_x = bx * m_macroblock_size;
-            
-            // Re-populate the 16x16 macroblock from the permuted sequence 
-            // using the zigzag spatial filling curve pattern
-            for (int k = 0; k < pixels_per_block; ++k) {
-                int zigzag_offset = m_zigzag_lut[k];
-                int local_y = zigzag_offset / m_macroblock_size;
-                int local_x = zigzag_offset % m_macroblock_size;
-                
-                int global_y = block_start_y + local_y;
-                int global_x = block_start_x + local_x;
-                
-                out_data[global_y * out_step + global_x] = dst_data[permuted_idx++];
-            }
+    const auto* src_data = m_flattened_ycbcr.ptr<cv::Vec3b>(0);
+
+    // zigzag_lut[b] = grid position where sorted block b is placed
+    // Block b contains pixels [b*pixels_per_block .. (b+1)*pixels_per_block)
+    for (int b = 0; b < B_x * B_y; ++b) {
+        // Destination grid position for block b
+        int grid_pos = m_zigzag_lut[b];
+        int dest_by  = grid_pos / B_x;
+        int dest_bx  = grid_pos % B_x;
+        int block_start_y = dest_by * m_macroblock_size;
+        int block_start_x = dest_bx * m_macroblock_size;
+
+        // Source: m^2 consecutive pixels from the sorted permutation
+        int src_base = b * pixels_per_block;
+
+        for (int k = 0; k < pixels_per_block; ++k) {
+            int local_y = k / m_macroblock_size;
+            int local_x = k % m_macroblock_size;
+            int global_y = block_start_y + local_y;
+            int global_x = block_start_x + local_x;
+            out_data[global_y * out_step + global_x] = src_data[m_sigma[src_base + k]];
         }
     }
     
