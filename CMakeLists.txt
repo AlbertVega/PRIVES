@@ -18,3 +18,10 @@ add_executable(test_anonymizer
 
 # Enlazar con OpenCV
 target_link_libraries(test_anonymizer PRIVATE ${OpenCV_LIBS})
+
+# Ejecutable de prueba para PosExtractor
+add_executable(test_pos
+    tests/test_pos.cpp
+    extraction/PosExtractor.cpp
+)
+target_link_libraries(test_pos PRIVATE ${OpenCV_LIBS})
