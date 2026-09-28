@@ -62,3 +62,21 @@ target_link_libraries(test_capture PRIVATE
     ${HAILORT_LIB}
     pthread
 )
+
+# Estimation module (HR / FR via IIR + FFT)
+# FFTW3 (spectral analysis, leverages ARM NEON on RPi 5)
+pkg_check_modules(FFTW3 REQUIRED fftw3)
+
+# Iir1 (real-time IIR filtering library by Bernd Porr)
+find_library(IIR1_LIB NAMES iir
+    PATHS /usr/lib /usr/local/lib
+    DOC "Iir1 shared library (libiir.so)")
+find_path(IIR1_INCLUDE_DIR NAMES Iir.h
+    PATHS /usr/include /usr/local/include /usr/include/iir /usr/local/include/iir
+    DOC "Iir1 header directory")
+
+if(NOT IIR1_LIB OR NOT IIR1_INCLUDE_DIR)
+    message(FATAL_ERROR
+        "Iir1 not found. Install via: sudo apt install libiir-dev  or build "
+        "from https://github.com/berndporr/iir1")
+endif()
