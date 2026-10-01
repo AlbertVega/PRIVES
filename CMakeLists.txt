@@ -80,3 +80,19 @@ if(NOT IIR1_LIB OR NOT IIR1_INCLUDE_DIR)
         "Iir1 not found. Install via: sudo apt install libiir-dev  or build "
         "from https://github.com/berndporr/iir1")
 endif()
+
+# Test executable for estimation (HR + FR processing)
+add_executable(test_estimation
+    tests/test_estimation.cpp
+    estimation/estimation.cpp
+)
+target_include_directories(test_estimation PRIVATE
+    ${FFTW3_INCLUDE_DIRS}
+    ${IIR1_INCLUDE_DIR}
+)
+target_link_libraries(test_estimation PRIVATE
+    ${OpenCV_LIBS}
+    ${FFTW3_LIBRARIES}
+    ${IIR1_LIB}
+    pthread
+)
