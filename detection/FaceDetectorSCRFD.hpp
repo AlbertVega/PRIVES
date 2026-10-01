@@ -2,6 +2,7 @@
 
 #include <opencv2/core.hpp>
 #include "hailo/hailort.hpp"
+#include "DetectionUtils.hpp"
 #include <string>
 #include <vector>
 #include <memory>
@@ -19,7 +20,6 @@
  */
 class FaceDetectorSCRFD {
 public:
-    // Constants
     // Fixed ROI output dimensions (multiples of 16 for anonimization requirement).
     static constexpr int kRoiW = 160;
     static constexpr int kRoiH = 208;
@@ -59,13 +59,6 @@ public:
     bool processFrame(const cv::Mat& input_bgr, cv::Mat& out_roi, cv::Rect& out_bbox);
 
 private:
-    // Internal types 
-    // A single decoded detection in the 640x640 letterbox coordinate space.
-    struct Detection {
-        cv::Rect box;
-        float score;
-    };
-
     // Configuration
     float m_score_threshold;
     static constexpr float kNmsIoUThreshold = 0.4f;
@@ -112,24 +105,12 @@ private:
     /**
      * @brief Decodes detections from one feature-pyramid scale.
      *
-     * @param score_data Pointer to dequantised FLOAT32 score tensor (H x W x 2 NHWC).
-     * @param bbox_data  Pointer to dequantised FLOAT32 bbox tensor  (H x W x 8 NHWC).
+     * @param score_data Pointer to dequantised FLOAT32 score tensor (H * W * 2 NHWC).
+     * @param bbox_data  Pointer to dequantised FLOAT32 bbox tensor  (H * W * 8 NHWC).
      * @param grid_h     Feature map height.
      * @param grid_w     Feature map width.
      * @param stride     Stride for this scale (8, 16, or 32).
      * @param detections Output vector to append decoded detections to.
      */
-    void decodeScale(const float* score_data,
-                     const float* bbox_data,
-                     int grid_h, int grid_w, int stride,
-                     std::vector<Detection>& detections) const;
-
-    /**
-     * @brief non-maximum suppression implementation. Keeps the highest-score
-     *        detection and suppresses any overlapping box with IoU > iou_threshold.
-     */
-    static void nms(std::vector<Detection>& detections, float iou_threshold);
-
-    /** @brief Computes Intersection-over-Union between two cv::Rects. */
-    static float computeIoU(const cv::Rect& a, const cv::Rect& b);
+    void decodeScale(const float* score_data, const float* bbox_data,int grid_h, int grid_w, int stride,std::vector<Detection>& detections) const;
 };

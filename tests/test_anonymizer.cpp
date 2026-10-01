@@ -1,85 +1,186 @@
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/generators/catch_generators.hpp>
+
 #include "../anonymizer/Anonymizer.hpp"
 #include <opencv2/core.hpp>
-#include <opencv2/imgcodecs.hpp>
-#include <iostream>
+#include <opencv2/imgproc.hpp>
 #include <cmath>
-#include <iomanip>
-#include <filesystem>
 
-int main(int argc, char* argv[]) {
-    std::cout << "Starting Test for Anonymizer..." << std::endl;
+using Catch::Matchers::WithinAbs;
 
-    // load an image to be anonymized (must be in the same directory as the executable or a valid path must be provided as an argument)
-    const std::string img_path = (argc > 1) ? argv[1] : "face.jpg";
-    cv::Mat img = cv::imread(img_path, cv::IMREAD_COLOR);
-    if (img.empty()) {
-        std::cerr << "ERROR: Could not load the image: " << img_path << std::endl;
-        std::cerr << "Usage: test_anonymizer [image_path]" << std::endl;
-        return 1;
+// Generates a synthetic BGR gradient frame whose dimensions are exact multiples
+// of macroblock_size. Each pixel gets a unique-ish colour so the permutation
+// test has something meaningful to check.
+static cv::Mat makeSyntheticFrame(int width, int height)
+{
+    cv::Mat frame(height, width, CV_8UC3);
+    for (int r = 0; r < height; ++r) {
+        for (int c = 0; c < width; ++c) {
+            frame.at<cv::Vec3b>(r, c) = cv::Vec3b(
+                static_cast<uint8_t>((r * 7 + c * 3) % 256),
+                static_cast<uint8_t>((r * 5 + c * 11) % 256),
+                static_cast<uint8_t>((r * 3 + c * 7) % 256));
+        }
     }
-    std::cout << "Image loaded: " << img_path
-              << " (" << img.cols << "x" << img.rows << ")" << std::endl;
+    return frame;
+}
 
-    Anonymizer anonymizer(16);
+// ---------------------------------------------------------------------------
+// Mean preservation (spatial invariance)
+// ---------------------------------------------------------------------------
+TEST_CASE("Anonymizer preserves per-channel mean within rounding tolerance", "[anonymizer][invariance]")
+{
+    constexpr int kMB = 16;
+    const cv::Mat frame = makeSyntheticFrame(160, 208);
+    Anonymizer anon(kMB);
 
-    // Calculate the mean of the original image
-    cv::Scalar mean_orig = cv::mean(img);
+    const cv::Scalar mean_orig = cv::mean(frame);
+    const cv::Mat anon_frame = anon.processFrame(frame);
+    const cv::Scalar mean_anon = cv::mean(anon_frame);
 
-    // Process for t=0 (Calibration and Permutation)
-    cv::Mat anonymized_t0 = anonymizer.processFrame(img);
-
-    // Calculate mean of t=0
-    cv::Scalar mean_t0 = cv::mean(anonymized_t0);
-
-    // Process for t=1 (Second pass with the same real image)
-    cv::Mat img_t1 = img.clone();
-    cv::Scalar mean_orig_t1 = cv::mean(img_t1);
-    cv::Mat anonymized_t1 = anonymizer.processFrame(img_t1);
-    cv::Scalar mean_t1 = cv::mean(anonymized_t1);
-
-    // Save results to disk
-    const std::filesystem::path output_dir = "anonymizer_results";
-    std::filesystem::create_directories(output_dir);
-
-    cv::imwrite((output_dir / "original.png").string(), img);
-    cv::imwrite((output_dir / "anonymized_t0.png").string(), anonymized_t0);
-    cv::imwrite((output_dir / "anonymized_t1.png").string(), anonymized_t1);
-    std::cout << "Images saved in build/" << output_dir.string() << " directory" << std::endl;
-
-    // Spatial invariance verification
-    // MAE < 10^-4 is expected, but due to rounding in integer conversion RGB <-> YCbCr 
-    // OpenCV generates a slight numerical error. We tolerate up to 1.0 for 8-bit colors.
-    double max_err_t0 = 0.0;
+    // Integer rounding in YCrCb<->BGR can introduce up to 1.0 per channel.
     for (int c = 0; c < 3; ++c) {
-        max_err_t0 = std::max(max_err_t0, std::abs(mean_orig[c] - mean_t0[c]));
+        REQUIRE_THAT(mean_anon[c], WithinAbs(mean_orig[c], 1.5));
     }
-    
-    double max_err_t1 = 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// Effective permutation - output must differ from input
+// ---------------------------------------------------------------------------
+TEST_CASE("Anonymizer actually permutes pixel positions", "[anonymizer][permutation]")
+{
+    const cv::Mat frame = makeSyntheticFrame(160, 208);
+    Anonymizer anon(16);
+
+    const cv::Mat anon_frame = anon.processFrame(frame);
+
+    // At least some pixels must have moved.
+    REQUIRE(anon_frame.size() == frame.size());
+    REQUIRE(anon_frame.type() == frame.type());
+
+    int identical_pixels = 0;
+    for (int r = 0; r < frame.rows; ++r) {
+        for (int c = 0; c < frame.cols; ++c) {
+            if (frame.at<cv::Vec3b>(r, c) == anon_frame.at<cv::Vec3b>(r, c)) {
+                ++identical_pixels;
+            }
+        }
+    }
+    const int total = frame.rows * frame.cols;
+    // With a gradient image, it is statistically impossible for > 50%
+    // of pixels to land in the exact same position after permutation.
+    REQUIRE(identical_pixels < total / 2);
+}
+
+// ---------------------------------------------------------------------------
+// Temporal determinism - same sigma yields identical output on the same input
+// ---------------------------------------------------------------------------
+TEST_CASE("Anonymizer is deterministic across consecutive frames", "[anonymizer][determinism]")
+{
+    const cv::Mat frame = makeSyntheticFrame(160, 208);
+    Anonymizer anon(16);
+
+    // t=0 calibrates, t=1 and t=2 reuse the same sigma.
+    const cv::Mat t0 = anon.processFrame(frame);
+    const cv::Mat t1 = anon.processFrame(frame);
+    const cv::Mat t2 = anon.processFrame(frame);
+
+    // t1 and t2 must be byte-identical since the input and sigma are the same.
+    cv::Mat diff;
+    cv::absdiff(t1, t2, diff);
+    REQUIRE(cv::countNonZero(diff.reshape(1)) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Input validation
+// ---------------------------------------------------------------------------
+TEST_CASE("Anonymizer rejects empty Mat", "[anonymizer][validation]")
+{
+    Anonymizer anon(16);
+    REQUIRE_THROWS_AS(anon.processFrame(cv::Mat()), std::invalid_argument);
+}
+
+TEST_CASE("Anonymizer rejects wrong channel type", "[anonymizer][validation]")
+{
+    Anonymizer anon(16);
+    cv::Mat grey(160, 208, CV_8UC1, cv::Scalar(128));
+    REQUIRE_THROWS_AS(anon.processFrame(grey), std::invalid_argument);
+}
+
+TEST_CASE("Anonymizer rejects non-multiple dimensions", "[anonymizer][validation]")
+{
+    Anonymizer anon(16);
+    // 161 is not a multiple of 16
+    cv::Mat bad(161, 160, CV_8UC3, cv::Scalar(100, 100, 100));
+    REQUIRE_THROWS_AS(anon.processFrame(bad), std::invalid_argument);
+}
+
+TEST_CASE("Anonymizer rejects macroblock_size <= 0", "[anonymizer][validation]")
+{
+    REQUIRE_THROWS_AS(Anonymizer(0), std::invalid_argument);
+    REQUIRE_THROWS_AS(Anonymizer(-4), std::invalid_argument);
+}
+
+// ---------------------------------------------------------------------------
+// reset() clears calibration state
+// ---------------------------------------------------------------------------
+TEST_CASE("Anonymizer reset clears calibration", "[anonymizer][reset]")
+{
+    const cv::Mat frame = makeSyntheticFrame(160, 208);
+    Anonymizer anon(16);
+
+    anon.processFrame(frame);
+    REQUIRE(anon.isCalibrated());
+
+    anon.reset();
+    REQUIRE_FALSE(anon.isCalibrated());
+
+    // After reset, processFrame must recalibrate without crashing.
+    const cv::Mat result = anon.processFrame(frame);
+    REQUIRE_FALSE(result.empty());
+    REQUIRE(anon.isCalibrated());
+}
+
+// ---------------------------------------------------------------------------
+// Recalibration on resolution change
+// ---------------------------------------------------------------------------
+TEST_CASE("Anonymizer recalibrates on resolution change", "[anonymizer][recalibration]")
+{
+    Anonymizer anon(16);
+
+    const cv::Mat frame_a = makeSyntheticFrame(160, 208);
+    anon.processFrame(frame_a);
+    REQUIRE(anon.isCalibrated());
+
+    // Feed a different resolution — should auto-reset and recalibrate.
+    const cv::Mat frame_b = makeSyntheticFrame(320, 320);
+    const cv::Mat result = anon.processFrame(frame_b);
+    REQUIRE_FALSE(result.empty());
+    REQUIRE(result.size() == frame_b.size());
+}
+
+// ---------------------------------------------------------------------------
+// Various macroblock sizes
+// ---------------------------------------------------------------------------
+TEST_CASE("Anonymizer works with different macroblock sizes", "[anonymizer][macroblock]")
+{
+    const int mb_size = GENERATE(4, 8, 16, 32);
+    // Frame dimensions must be multiples of mb_size.
+    const int w = mb_size * 5;
+    const int h = mb_size * 4;
+
+    Anonymizer anon(mb_size);
+    const cv::Mat frame = makeSyntheticFrame(w, h);
+    const cv::Mat result = anon.processFrame(frame);
+
+    REQUIRE(result.size() == frame.size());
+    REQUIRE(result.type() == CV_8UC3);
+
+    // Mean preservation check.
+    const cv::Scalar m_orig = cv::mean(frame);
+    const cv::Scalar m_anon = cv::mean(result);
     for (int c = 0; c < 3; ++c) {
-        max_err_t1 = std::max(max_err_t1, std::abs(mean_orig_t1[c] - mean_t1[c]));
+        REQUIRE_THAT(m_anon[c], WithinAbs(m_orig[c], 1.5));
     }
-
-    std::cout << std::fixed << std::setprecision(6);
-    std::cout << "Original Mean t=0: [" << mean_orig[0] << ", " << mean_orig[1] << ", " << mean_orig[2] << "]" << std::endl;
-    std::cout << "Anonymized Mean t=0: [" << mean_t0[0] << ", " << mean_t0[1] << ", " << mean_t0[2] << "]" << std::endl;
-    std::cout << "Max MAE at t=0: " << max_err_t0 << std::endl;
-    std::cout << "--------------------------------------------------" << std::endl;
-    std::cout << "Original Mean t=1: [" << mean_orig_t1[0] << ", " << mean_orig_t1[1] << ", " << mean_orig_t1[2] << "]" << std::endl;
-    std::cout << "Anonymized Mean t=1: [" << mean_t1[0] << ", " << mean_t1[1] << ", " << mean_t1[2] << "]" << std::endl;
-    std::cout << "Max MAE at t=1: " << max_err_t1 << std::endl;
-
-    double tolerance = 1.0; // Tolerance due to integer rounding of the conversion YCrCb to BGR
-    
-    if (max_err_t0 > tolerance) {
-        std::cerr << "FAIL: Mean difference too high at t=0. Expected <= " << tolerance << ", got " << max_err_t0 << std::endl;
-        return 1;
-    }
-    
-    if (max_err_t1 > tolerance) {
-        std::cerr << "FAIL: Mean difference too high at t=1. Expected <= " << tolerance << ", got " << max_err_t1 << std::endl;
-        return 1;
-    }
-
-    std::cout << "SUCCESS: Mathematical invariance verification passed." << std::endl;
-    return 0;
 }

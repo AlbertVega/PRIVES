@@ -1,4 +1,5 @@
 #include "FaceDetectorSCRFD.hpp"
+#include "DetectionUtils.hpp"
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
@@ -9,8 +10,8 @@ namespace {
 
 // Describes one feature-pyramid scale of the SCRFD-2.5G HEF output.
 struct ScaleInfo {
-    const char* score_name;   // Classification logits  (H × W × 2)
-    const char* bbox_name;    // Bounding-box distances (H × W × 8)
+    const char* score_name;   // Classification logits  (H * W * 2)
+    const char* bbox_name;    // Bounding-box distances (H * W * 8)
     int stride;               // Spatial stride (8, 16, or 32)
     int grid_h;               // Feature-map height
     int grid_w;               // Feature-map width
@@ -26,9 +27,8 @@ static const ScaleInfo kScales[] = {
 }
 
 // Constructor - HailoRT initialisation
-FaceDetectorSCRFD::FaceDetectorSCRFD(const std::string& hef_path,
-                                     float score_threshold)
-                : m_score_threshold(score_threshold)
+FaceDetectorSCRFD::FaceDetectorSCRFD(const std::string& hef_path, float score_threshold)
+    : m_score_threshold(score_threshold)
 {
     using namespace hailort;
 
@@ -36,8 +36,7 @@ FaceDetectorSCRFD::FaceDetectorSCRFD(const std::string& hef_path,
     auto vdevice_exp = VDevice::create();
     if (!vdevice_exp) {
         throw std::runtime_error(
-            "Failed to create Hailo VDevice (status=" +
-            std::to_string(static_cast<int>(vdevice_exp.status())) + ")."
+            "Failed to create Hailo VDevice (status=" + std::to_string(static_cast<int>(vdevice_exp.status())) + ")."
             " Is the Hailo-8 device connected and hailort driver loaded?");
     }
     m_vdevice = vdevice_exp.release();
@@ -56,9 +55,8 @@ FaceDetectorSCRFD::FaceDetectorSCRFD(const std::string& hef_path,
     }
     auto net_groups_exp = m_vdevice->configure(hef, cfg_params_exp.value());
     if (!net_groups_exp) {
-        throw std::runtime_error(
-            "Failed to configure network group on device (status=" +
-            std::to_string(static_cast<int>(net_groups_exp.status())) + ")");
+        throw std::runtime_error("Failed to configure network group on device (status=" + 
+                                std::to_string(static_cast<int>(net_groups_exp.status())) + ")");
     }
     m_network_group = std::move(net_groups_exp.value()[0]);
 
@@ -162,15 +160,10 @@ void FaceDetectorSCRFD::preprocess(const cv::Mat& input_bgr)
     cv::cvtColor(input_bgr, m_rgb_frame, cv::COLOR_BGR2RGB);
 
     // Compute letterbox scaling (preserve aspect ratio, pad remainder)
-    const float scale_w = static_cast<float>(kInputW) / input_bgr.cols;
-    const float scale_h = static_cast<float>(kInputH) / input_bgr.rows;
-    m_lb_scale = std::min(scale_w, scale_h);
+    computeLetterboxParams(input_bgr.cols, input_bgr.rows, kInputW, m_lb_scale, m_lb_pad_left, m_lb_pad_top);
 
     const int new_w = static_cast<int>(input_bgr.cols * m_lb_scale);
     const int new_h = static_cast<int>(input_bgr.rows * m_lb_scale);
-
-    m_lb_pad_left = (kInputW - new_w) / 2;
-    m_lb_pad_top  = (kInputH - new_h) / 2;
 
     // Resize maintaining aspect ratio
     cv::resize(m_rgb_frame, m_resized_temp, cv::Size(new_w, new_h), 0, 0, cv::INTER_LINEAR);
@@ -229,8 +222,8 @@ void FaceDetectorSCRFD::postprocess(const cv::Mat& original_frame, std::vector<D
         decodeScale(score_data, bbox_data, s.grid_h, s.grid_w, s.stride, detections);
     }
 
-    // Non-Maximum Suppression (NMS)
-    nms(detections, kNmsIoUThreshold);
+    // Non-Maximum Suppression
+    ::nms(detections, kNmsIoUThreshold);
 
     // Map from 640x640 letterbox space -> original frame coordinates
     const int orig_w = original_frame.cols;
@@ -308,48 +301,3 @@ void FaceDetectorSCRFD::decodeScale(
     }
 }
 
-// Non-Maximum Suppression (NMS)
-void FaceDetectorSCRFD::nms(std::vector<Detection>& detections, float iou_threshold)
-{
-    if (detections.empty()) {
-        return;
-    }
-
-    // Sort by score descending — the first surviving detection is the best.
-    std::sort(detections.begin(), detections.end(),
-              [](const Detection& a, const Detection& b) {
-                  return a.score > b.score;
-              });
-
-    std::vector<bool> suppressed(detections.size(), false);
-    std::vector<Detection> kept;
-    kept.reserve(detections.size());
-
-    for (size_t i = 0; i < detections.size(); ++i) {
-        if (suppressed[i]) {
-            continue;
-        }
-        kept.push_back(detections[i]);
-
-        for (size_t j = i + 1; j < detections.size(); ++j) {
-            if (suppressed[j]) {
-                continue;
-            }
-            if (computeIoU(detections[i].box, detections[j].box) >
-                iou_threshold) {
-                suppressed[j] = true;
-            }
-        }
-    }
-
-    detections = std::move(kept);
-}
-
-// Intersection-over-Union
-float FaceDetectorSCRFD::computeIoU(const cv::Rect& a, const cv::Rect& b)
-{
-    const cv::Rect intersection = a & b; // OpenCV rect intersection
-    const float area_inter = static_cast<float>(intersection.area());
-    const float area_union = static_cast<float>(a.area() + b.area()) - area_inter;
-    return (area_union > 0.0f) ? (area_inter / area_union) : 0.0f;
-}
