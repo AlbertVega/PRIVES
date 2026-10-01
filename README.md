@@ -24,3 +24,7 @@ cmake ..
 # Compile
 cmake --build .
 ```
+
+## Testing
+
+For detailed information about the test suite (Catch2), test coverage, how to run tests locally, and the GitHub Actions CI setup, please refer to the [Test Suite Documentation](docs/tests.md).
