@@ -162,3 +162,33 @@ if(HAVE_HAILORT AND HAVE_GSTREAMER)
 else()
     message(STATUS "  [SKIP] facedetection_demo (missing HailoRT or GStreamer)")
 endif()
+
+# ---------------------------------------------------------------------------
+# PRIVES main pipeline (requires ALL hardware/library dependencies)
+# ---------------------------------------------------------------------------
+if(HAVE_HAILORT AND HAVE_GSTREAMER AND HAVE_FFTW3 AND HAVE_IIR1)
+    add_executable(prives
+        main.cpp
+        detection/FaceDetectorSCRFD.cpp
+        detection/DetectionUtils.cpp
+        anonymizer/Anonymizer.cpp
+        extraction/PosExtractor.cpp
+        estimation/estimation.cpp
+    )
+    target_include_directories(prives PRIVATE
+        ${GSTREAMER_INCLUDE_DIRS}
+        ${HAILORT_INCLUDE_DIR}
+        ${FFTW3_INCLUDE_DIRS}
+        ${IIR1_INCLUDE_DIR}
+    )
+    target_link_libraries(prives PRIVATE
+        ${OpenCV_LIBS}
+        ${GSTREAMER_LIBRARIES}
+        ${HAILORT_LIB}
+        ${FFTW3_LIBRARIES}
+        ${IIR1_LIB}
+        pthread
+    )
+else()
+    message(STATUS "  [SKIP] prives (missing HailoRT, GStreamer, FFTW3, or Iir1)")
+endif()
