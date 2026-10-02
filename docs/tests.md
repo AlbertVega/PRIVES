@@ -62,9 +62,20 @@ To run the tests on your local machine or WSL, follow these steps:
 ### 1. Install Dependencies (Linux / WSL)
 You will need build tools, OpenCV, FFTW3, and the Iir1 library.
 
+First, install the packages available in the repository:
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake libopencv-dev libfftw3-dev libiir-dev
+sudo apt-get install -y build-essential cmake libopencv-dev libfftw3-dev
+```
+
+Then, compile and install the `iir1` library from source:
+```bash
+git clone https://github.com/berndporr/iir1.git
+cd iir1
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+sudo cmake --install build
+cd ..
 ```
 
 *(Catch2 is downloaded automatically via CMake/FetchContent when generating the configuration, so there is no need to install it manually).*

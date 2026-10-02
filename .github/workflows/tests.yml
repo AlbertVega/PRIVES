@@ -19,8 +19,15 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake \
             libopencv-dev \
-            libfftw3-dev \
-            libiir-dev
+            libfftw3-dev
+
+      - name: Build and install Iir1
+        run: |
+          git clone https://github.com/berndporr/iir1.git
+          cd iir1
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+          sudo cmake --install build
 
       - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
