@@ -14,6 +14,7 @@
 #include "anonymizer/Anonymizer.hpp"
 #include "extraction/PosExtractor.hpp"
 #include "estimation/estimation.hpp"
+#include "streaming/MjpegStreamer.hpp"
 
 #include <opencv2/videoio.hpp>
 #include <opencv2/core.hpp>
@@ -144,6 +145,13 @@ namespace cfg {
     // SCRFD model
     constexpr char  kHefPath[]        = "scrfd_2.5g.hef";
     constexpr float kScoreThreshold   = 0.5f;
+
+    // MJPEG streaming
+    constexpr int kStreamPort    = 8080;
+    constexpr int kJpegQuality   = 50;
+
+    // Console statistics interval (frames)
+    constexpr int kStatsInterval = 30;
 }
 
 // ----------------------------------------------------------------------------
@@ -204,25 +212,34 @@ static void captureThread(BoundedQueue<cv::Mat>& capture_queue)
 /**
  * @brief Runs SCRFD face detection on each captured frame.
  *
- * On detection the 160*208 ROI is forwarded to the DSP queue. The original
- * camera frame is released immediately after detection
+ * On detection the 160x208 ROI is forwarded to the DSP queue. Just before
+ * releasing the original frame, a composed overlay is pushed to the MJPEG
+ * streamer for live browser visualisation.
  *
  * When tracking is lost (no detection), all downstream modules are reset so
  * that signal buffers do not mix data from different subjects.
  *
- * @param capture_queue Incoming frames from the capture thread.
- * @param roi_queue     Outgoing 160*208 ROIs to the DSP thread.
- * @param anonymizer    Shared reference for cross-thread reset.
- * @param pos_extractor Shared reference for cross-thread reset.
- * @param estimator     Shared reference for cross-thread reset.
- * @param dsp_mutex     Protects reset() calls on DSP-owned objects.
+ * @param capture_queue    Incoming frames from the capture thread.
+ * @param roi_queue        Outgoing 160x208 ROIs to the DSP thread.
+ * @param anonymizer       Shared reference for cross-thread reset.
+ * @param pos_extractor    Shared reference for cross-thread reset.
+ * @param estimator        Shared reference for cross-thread reset.
+ * @param dsp_mutex        Protects reset() calls on DSP-owned objects.
+ * @param streamer         MJPEG HTTP streamer for live visualisation.
+ * @param shared_hr        Atomic HR value published by the DSP thread.
+ * @param shared_fr        Atomic FR value published by the DSP thread.
+ * @param vitals_ready     Atomic flag: true once the estimator is calibrated.
  */
 static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
                             BoundedQueue<cv::Mat>& roi_queue,
                             Anonymizer&            anonymizer,
                             PosExtractor&          pos_extractor,
                             estimation&            estimator,
-                            std::mutex&            dsp_mutex)
+                            std::mutex&            dsp_mutex,
+                            MjpegStreamer&          streamer,
+                            std::atomic<double>&   shared_hr,
+                            std::atomic<double>&   shared_fr,
+                            std::atomic<bool>&     vitals_ready)
 {
     // Initialise the NPU-accelerated detector.
     FaceDetectorSCRFD detector(cfg::kHefPath, cfg::kScoreThreshold);
@@ -232,17 +249,45 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
     cv::Rect bbox;
     bool     was_tracking = false;
 
+    // FPS / latency tracking.
+    int  frame_count = 0;
+    auto t_start     = std::chrono::steady_clock::now();
+
     while (g_running.load(std::memory_order_relaxed)) {
         auto maybe_frame = capture_queue.pop(g_running);
         if (!maybe_frame.has_value()) {
             break;  // Shutdown.
         }
 
+        const auto t_frame = std::chrono::steady_clock::now();
+
         cv::Mat frame = std::move(maybe_frame.value());
 
         const bool detected = detector.processFrame(frame, roi, bbox);
 
-        // Destroy the original frame immediately.
+        // Measure detection latency and running FPS.
+        const auto t_done = std::chrono::steady_clock::now();
+        const double latency_ms =
+            std::chrono::duration<double, std::milli>(t_done - t_frame).count();
+        ++frame_count;
+        const double elapsed_s =
+            std::chrono::duration<double>(t_done - t_start).count();
+        const double fps = (elapsed_s > 0.0) ? frame_count / elapsed_s : 0.0;
+
+        // Stream the composed frame BEFORE destroying the original. 
+        FrameInfo fi;
+        fi.detected     = detected;
+        fi.bbox         = bbox;
+        fi.roi          = roi;  // Shallow copy - streamer clones internally.
+        fi.latency_ms   = latency_ms;
+        fi.fps          = fps;
+        fi.hr_bpm       = shared_hr.load(std::memory_order_relaxed);
+        fi.fr_rpm       = shared_fr.load(std::memory_order_relaxed);
+        fi.vitals_ready = vitals_ready.load(std::memory_order_relaxed);
+
+        streamer.pushFrame(frame, fi);
+
+        // Privacy: destroy the original frame immediately.
         frame.release();
 
         if (detected) {
@@ -256,6 +301,7 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
                 anonymizer.reset();
                 pos_extractor.reset();
                 estimator.reset();
+                vitals_ready.store(false, std::memory_order_relaxed);
                 std::cout << "[DETECT]  Tracking lost - downstream modules reset."
                           << std::endl;
             }
@@ -263,6 +309,15 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
         }
 
         roi.release();
+
+        // Console statistics every N frames.
+        if (frame_count % cfg::kStatsInterval == 0) {
+            std::cout << std::fixed << std::setprecision(1)
+                      << "[STATS]  FPS: " << fps
+                      << " | Latency: " << latency_ms << " ms"
+                      << (detected ? " | Face OK" : " | No face")
+                      << std::endl;
+        }
     }
 
     roi_queue.shutdown();
@@ -277,20 +332,27 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
  * @brief Final pipeline stage: anonymise the ROI, extract the BVP signal via
  *        POS, and feed it into the HR / FR estimator.
  *
- * When the estimator completes its calibration phase and produces a 1-second
- * update, the latest vital signs are printed to stdout.
+ * When the estimator produces a 1-second update, the latest vital signs are
+ * printed to stdout and published to shared atomics so the detection thread
+ * can include them in the MJPEG overlay.
  *
- * @param roi_queue     Incoming 160*208 face ROIs.
+ * @param roi_queue     Incoming 160x208 face ROIs.
  * @param anonymizer    Spatial anonymization module.
  * @param pos_extractor POS BVP extraction module.
  * @param estimator     HR / FR estimation module.
  * @param dsp_mutex     Protects against concurrent reset() from the detection thread.
+ * @param shared_hr     Atomic HR output for the streamer overlay.
+ * @param shared_fr     Atomic FR output for the streamer overlay.
+ * @param vitals_ready  Atomic flag set once estimation is calibrated.
  */
 static void dspThread(BoundedQueue<cv::Mat>& roi_queue,
                       Anonymizer&            anonymizer,
                       PosExtractor&          pos_extractor,
                       estimation&            estimator,
-                      std::mutex&            dsp_mutex)
+                      std::mutex&            dsp_mutex,
+                      std::atomic<double>&   shared_hr,
+                      std::atomic<double>&   shared_fr,
+                      std::atomic<bool>&     vitals_ready)
 {
     std::cout << "[DSP]    Processing thread started." << std::endl;
 
@@ -325,6 +387,11 @@ static void dspThread(BoundedQueue<cv::Mat>& roi_queue,
         const bool updated = estimator.process_sample(bvp, hr_bpm, fr_rpm);
 
         if (updated) {
+            // Publish to shared atomics for the MJPEG overlay.
+            shared_hr.store(hr_bpm, std::memory_order_relaxed);
+            shared_fr.store(fr_rpm, std::memory_order_relaxed);
+            vitals_ready.store(true, std::memory_order_relaxed);
+
             std::cout << std::fixed << std::setprecision(1)
                       << "[VITALS] HR: " << hr_bpm << " BPM"
                       << " | FR: " << fr_rpm << " RPM"
@@ -341,9 +408,10 @@ static void dspThread(BoundedQueue<cv::Mat>& roi_queue,
 
 int main()
 {
-    // Register signal handlers for graceful shutdown
+    // Register signal handlers for graceful shutdown.
     std::signal(SIGINT,  signalHandler);
     std::signal(SIGTERM, signalHandler);
+    std::signal(SIGPIPE, SIG_IGN);  // Prevent crash on broken client socket.
 
     std::cout
         << "============================================================\n"
@@ -352,7 +420,7 @@ int main()
         << "============================================================\n"
         << std::endl;
 
-    // Shared modules (owned by main, referenced by threads)
+    // Shared modules (owned by main, referenced by threads).
     Anonymizer   anonymizer;
     PosExtractor pos_extractor;
     estimation   estimator;
@@ -360,11 +428,19 @@ int main()
     // Mutex that serialises DSP processing against cross-thread resets.
     std::mutex dsp_mutex;
 
-    // Inter-thread queues
+    // Shared vital-signs output (DSP thread writes, detection thread reads for overlay).
+    std::atomic<double> shared_hr{0.0};
+    std::atomic<double> shared_fr{0.0};
+    std::atomic<bool>   vitals_ready{false};
+
+    // MJPEG HTTP streamer (starts its own background accept thread).
+    MjpegStreamer streamer(cfg::kStreamPort, cfg::kJpegQuality);
+
+    // Inter-thread queues.
     BoundedQueue<cv::Mat> capture_queue(cfg::kCaptureQueueSize);
     BoundedQueue<cv::Mat> roi_queue(cfg::kRoiQueueSize);
 
-    // Launch pipeline threads
+    // Launch pipeline threads.
     std::thread t_capture(captureThread, std::ref(capture_queue));
 
     std::thread t_detect(detectionThread,
@@ -373,19 +449,26 @@ int main()
                          std::ref(anonymizer),
                          std::ref(pos_extractor),
                          std::ref(estimator),
-                         std::ref(dsp_mutex));
+                         std::ref(dsp_mutex),
+                         std::ref(streamer),
+                         std::ref(shared_hr),
+                         std::ref(shared_fr),
+                         std::ref(vitals_ready));
 
     std::thread t_dsp(dspThread,
                       std::ref(roi_queue),
                       std::ref(anonymizer),
                       std::ref(pos_extractor),
                       std::ref(estimator),
-                      std::ref(dsp_mutex));
+                      std::ref(dsp_mutex),
+                      std::ref(shared_hr),
+                      std::ref(shared_fr),
+                      std::ref(vitals_ready));
 
     std::cout << "[MAIN]   All threads launched. Press Ctrl+C to stop.\n"
               << std::endl;
 
-    // Wait for shutdown 
+    // Wait for shutdown.
     // The main thread simply waits for the worker threads to finish. The
     // signal handler sets g_running = false, which unblocks the queues and
     // causes all threads to exit their loops.

@@ -174,6 +174,7 @@ if(HAVE_HAILORT AND HAVE_GSTREAMER AND HAVE_FFTW3 AND HAVE_IIR1)
         anonymizer/Anonymizer.cpp
         extraction/PosExtractor.cpp
         estimation/estimation.cpp
+        streaming/MjpegStreamer.cpp
     )
     target_include_directories(prives PRIVATE
         ${GSTREAMER_INCLUDE_DIRS}
