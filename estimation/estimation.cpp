@@ -1,4 +1,5 @@
 #include "estimation.hpp"
+#include "../benchmarks/include/prives_profiler.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -65,8 +66,13 @@ estimation::~estimation()
 bool estimation::process_sample(double bvp_sample, double& hr_bpm, double& fr_rpm)
 {
     // Apply IIR bandpass filters (sample-by-sample)
-    const double hr_filtered = m_hr_filter.filter(bvp_sample);
-    const double fr_filtered = m_fr_filter.filter(bvp_sample);
+    double hr_filtered = 0.0;
+    double fr_filtered = 0.0;
+    {
+        PRIVES_PROFILE_ACTIVE_STAGE(prives::bench::Stage::IirFilter);
+        hr_filtered = m_hr_filter.filter(bvp_sample);
+        fr_filtered = m_fr_filter.filter(bvp_sample);
+    }
 
     // Store in respective circular buffers
     m_hr_buf[m_hr_head] = hr_filtered;
@@ -88,11 +94,14 @@ bool estimation::process_sample(double bvp_sample, double& hr_bpm, double& fr_rp
     const bool hr_ready = (m_total_samples >= kHrCalibSamples);
     const bool fr_ready = (m_total_samples >= kFrCalibSamples);
 
-    if (hr_ready) {
-        hr_bpm = computeHR();
-    }
-    if (fr_ready) {
-        fr_rpm = computeFR();
+    if (hr_ready || fr_ready) {
+        PRIVES_PROFILE_ACTIVE_STAGE(prives::bench::Stage::Fft);
+        if (hr_ready) {
+            hr_bpm = computeHR();
+        }
+        if (fr_ready) {
+            fr_rpm = computeFR();
+        }
     }
 
     return hr_ready && fr_ready;

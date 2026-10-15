@@ -4,6 +4,9 @@ project(PRIVES LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(PRIVES_ENABLE_PROFILING
+    "Build prives with per-frame latency instrumentation (benchmarks/include/prives_profiler.hpp)" OFF)
+
 # ---------------------------------------------------------------------------
 # Core dependency (always required)
 # ---------------------------------------------------------------------------
@@ -84,6 +87,7 @@ message(STATUS "  FFTW3      : ${HAVE_FFTW3}")
 message(STATUS "  Iir1       : ${HAVE_IIR1}")
 message(STATUS "  HailoRT    : ${HAVE_HAILORT}")
 message(STATUS "  GStreamer   : ${HAVE_GSTREAMER}")
+message(STATUS "  Profiling  : ${PRIVES_ENABLE_PROFILING}")
 message(STATUS "")
 
 # ---------------------------------------------------------------------------
@@ -190,6 +194,9 @@ if(HAVE_HAILORT AND HAVE_GSTREAMER AND HAVE_FFTW3 AND HAVE_IIR1)
         ${IIR1_LIB}
         pthread
     )
+    if(PRIVES_ENABLE_PROFILING)
+        target_compile_definitions(prives PRIVATE PRIVES_PROFILING=1)
+    endif()
 else()
     message(STATUS "  [SKIP] prives (missing HailoRT, GStreamer, FFTW3, or Iir1)")
 endif()

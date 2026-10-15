@@ -15,6 +15,7 @@
 #include "extraction/PosExtractor.hpp"
 #include "estimation/estimation.hpp"
 #include "streaming/MjpegStreamer.hpp"
+#include "benchmarks/include/prives_profiler.hpp"
 
 #include <opencv2/videoio.hpp>
 #include <opencv2/core.hpp>
@@ -73,18 +74,22 @@ public:
      * discarded so the consumer never processes stale data.
      *
      * @param item Element to enqueue (moved in).
+     * @return The evicted element, if any (used for dropped-frame telemetry).
      */
-    void push(T item)
+    std::optional<T> push(T item)
     {
+        std::optional<T> evicted;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_buffer.size() >= m_capacity) {
                 // Drop the oldest element (front) to avoid latency build-up.
+                evicted = std::move(m_buffer.front());
                 m_buffer.erase(m_buffer.begin());
             }
             m_buffer.push_back(std::move(item));
         }
         m_cv.notify_one();
+        return evicted;
     }
 
     /**
@@ -128,6 +133,23 @@ private:
 };
 
 // ----------------------------------------------------------------------------
+// Frame container (image + per-frame telemetry)
+// ----------------------------------------------------------------------------
+
+namespace bench = prives::bench;
+
+/**
+ * @brief Unit of work exchanged between pipeline threads.
+ *
+ * The timing record is a no-op payload unless PRIVES_PROFILING is defined.
+ */
+struct PipelineFrame
+{
+    cv::Mat            image;
+    bench::FrameRecord timing;
+};
+
+// ----------------------------------------------------------------------------
 // Pipeline configuration
 // ----------------------------------------------------------------------------
 
@@ -164,7 +186,8 @@ namespace cfg {
  * The GStreamer sink is configured with `drop=true max-buffers=1` so the kernel
  * driver never stalls if the consumer is slower than the camera.
  */
-static void captureThread(BoundedQueue<cv::Mat>& capture_queue)
+static void captureThread(BoundedQueue<PipelineFrame>& capture_queue,
+                          bench::TelemetrySink&       telemetry)
 {
     const std::string gst_pipeline =
         "v4l2src device=" + std::string(cfg::kCameraDevice) + " ! "
@@ -190,14 +213,32 @@ static void captureThread(BoundedQueue<cv::Mat>& capture_queue)
               << " @ " << cfg::kCaptureFps << " FPS)." << std::endl;
 
     cv::Mat frame;
+    std::uint64_t frame_id = 0;
+    const bench::OcclusionSchedule occlusion;
 
     while (g_running.load(std::memory_order_relaxed)) {
+        const auto t_read_start = bench::Clock::now();
         if (!cap.read(frame) || frame.empty()) {
             // Transient read failure (USB hiccup, etc.) - retry silently.
             continue;
         }
+        const auto t_delivered = bench::Clock::now();
+
+        PipelineFrame item;
+        item.timing.begin(frame_id++, t_delivered);
+        item.timing.add(bench::Stage::Capture, t_delivered - t_read_start);
+
         // Push a *copy* so the capture buffer can be reused immediately.
-        capture_queue.push(frame.clone());
+        item.image = frame.clone();
+
+        // Benchmark scenario E2: blank the frame to force tracking loss.
+        if (occlusion.occluded(t_delivered)) {
+            item.image.setTo(cv::Scalar::all(0));
+        }
+
+        if (auto evicted = capture_queue.push(std::move(item))) {
+            telemetry.commit(evicted->timing, /*dropped=*/true);
+        }
     }
 
     cap.release();
@@ -229,9 +270,10 @@ static void captureThread(BoundedQueue<cv::Mat>& capture_queue)
  * @param shared_hr        Atomic HR value published by the DSP thread.
  * @param shared_fr        Atomic FR value published by the DSP thread.
  * @param vitals_ready     Atomic flag: true once the estimator is calibrated.
+ * @param telemetry        Per-frame latency sink (no-op unless profiling is enabled).
  */
-static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
-                            BoundedQueue<cv::Mat>& roi_queue,
+static void detectionThread(BoundedQueue<PipelineFrame>& capture_queue,
+                            BoundedQueue<PipelineFrame>& roi_queue,
                             Anonymizer&            anonymizer,
                             PosExtractor&          pos_extractor,
                             estimation&            estimator,
@@ -239,7 +281,8 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
                             MjpegStreamer&          streamer,
                             std::atomic<double>&   shared_hr,
                             std::atomic<double>&   shared_fr,
-                            std::atomic<bool>&     vitals_ready)
+                            std::atomic<bool>&     vitals_ready,
+                            bench::TelemetrySink&  telemetry)
 {
     // Initialise the NPU-accelerated detector.
     FaceDetectorSCRFD detector(cfg::kHefPath, cfg::kScoreThreshold);
@@ -261,9 +304,14 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
 
         const auto t_frame = std::chrono::steady_clock::now();
 
-        cv::Mat frame = std::move(maybe_frame.value());
+        cv::Mat frame = std::move(maybe_frame->image);
+        bench::FrameRecord timing = maybe_frame->timing;
 
-        const bool detected = detector.processFrame(frame, roi, bbox);
+        bool detected = false;
+        {
+            bench::ScopedStage stage(timing, bench::Stage::Npu);
+            detected = detector.processFrame(frame, roi, bbox);
+        }
 
         // Measure detection latency and running FPS.
         const auto t_done = std::chrono::steady_clock::now();
@@ -293,7 +341,9 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
         if (detected) {
             was_tracking = true;
             // Forward the ROI (clone to decouple from detector internals).
-            roi_queue.push(roi.clone());
+            if (auto evicted = roi_queue.push(PipelineFrame{roi.clone(), timing})) {
+                telemetry.commit(evicted->timing, /*dropped=*/true);
+            }
         } else {
             if (was_tracking) {
                 // Tracking was just lost - reset all downstream state.
@@ -306,6 +356,8 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
                           << std::endl;
             }
             was_tracking = false;
+            // No face: the frame terminates here.
+            telemetry.commit(timing);
         }
 
         roi.release();
@@ -344,15 +396,17 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
  * @param shared_hr     Atomic HR output for the streamer overlay.
  * @param shared_fr     Atomic FR output for the streamer overlay.
  * @param vitals_ready  Atomic flag set once estimation is calibrated.
+ * @param telemetry     Per-frame latency sink (no-op unless profiling is enabled).
  */
-static void dspThread(BoundedQueue<cv::Mat>& roi_queue,
+static void dspThread(BoundedQueue<PipelineFrame>& roi_queue,
                       Anonymizer&            anonymizer,
                       PosExtractor&          pos_extractor,
                       estimation&            estimator,
                       std::mutex&            dsp_mutex,
                       std::atomic<double>&   shared_hr,
                       std::atomic<double>&   shared_fr,
-                      std::atomic<bool>&     vitals_ready)
+                      std::atomic<bool>&     vitals_ready,
+                      bench::TelemetrySink&  telemetry)
 {
     std::cout << "[DSP]    Processing thread started." << std::endl;
 
@@ -362,29 +416,45 @@ static void dspThread(BoundedQueue<cv::Mat>& roi_queue,
             break;  // Shutdown.
         }
 
-        cv::Mat roi = std::move(maybe_roi.value());
+        cv::Mat roi = std::move(maybe_roi->image);
+        bench::FrameRecord timing = maybe_roi->timing;
 
         // All three DSP stages share state that the detection thread may
         // reset when tracking is lost, so we hold the mutex throughout.
         std::lock_guard<std::mutex> lock(dsp_mutex);
 
         // Spatial anonymization (de-identification).
-        cv::Mat anonymized = anonymizer.processFrame(roi);
+        cv::Mat anonymized;
+        {
+            bench::ScopedStage stage(timing, bench::Stage::Anonymize);
+            anonymized = anonymizer.processFrame(roi);
+        }
         roi.release();  // Original ROI no longer needed.
 
         // BVP signal extraction (POS algorithm).
         double bvp = 0.0;
-        const bool bvp_ready = pos_extractor.processFrame(anonymized, bvp);
+        bool bvp_ready = false;
+        {
+            bench::ScopedStage stage(timing, bench::Stage::PosDetrend);
+            bvp_ready = pos_extractor.processFrame(anonymized, bvp);
+        }
         anonymized.release();
 
         if (!bvp_ready) {
+            telemetry.commit(timing);
             continue;  // Still in warm-up phase.
         }
 
         // HR / FR estimation (IIR filtering + FFT).
         double hr_bpm = 0.0;
         double fr_rpm = 0.0;
-        const bool updated = estimator.process_sample(bvp, hr_bpm, fr_rpm);
+        bool updated = false;
+        {
+            // Filter and FFT stages are timed inside the estimation module.
+            bench::ActiveRecordScope bind(timing);
+            updated = estimator.process_sample(bvp, hr_bpm, fr_rpm);
+        }
+        telemetry.commit(timing);
 
         if (updated) {
             // Publish to shared atomics for the MJPEG overlay.
@@ -436,12 +506,16 @@ int main()
     // MJPEG HTTP streamer (starts its own background accept thread).
     MjpegStreamer streamer(cfg::kStreamPort, cfg::kJpegQuality);
 
+    // Per-frame latency telemetry (no-op unless built with PRIVES_PROFILING).
+    bench::TelemetrySink telemetry;
+    telemetry.start();
+
     // Inter-thread queues.
-    BoundedQueue<cv::Mat> capture_queue(cfg::kCaptureQueueSize);
-    BoundedQueue<cv::Mat> roi_queue(cfg::kRoiQueueSize);
+    BoundedQueue<PipelineFrame> capture_queue(cfg::kCaptureQueueSize);
+    BoundedQueue<PipelineFrame> roi_queue(cfg::kRoiQueueSize);
 
     // Launch pipeline threads.
-    std::thread t_capture(captureThread, std::ref(capture_queue));
+    std::thread t_capture(captureThread, std::ref(capture_queue), std::ref(telemetry));
 
     std::thread t_detect(detectionThread,
                          std::ref(capture_queue),
@@ -453,7 +527,8 @@ int main()
                          std::ref(streamer),
                          std::ref(shared_hr),
                          std::ref(shared_fr),
-                         std::ref(vitals_ready));
+                         std::ref(vitals_ready),
+                         std::ref(telemetry));
 
     std::thread t_dsp(dspThread,
                       std::ref(roi_queue),
@@ -463,7 +538,8 @@ int main()
                       std::ref(dsp_mutex),
                       std::ref(shared_hr),
                       std::ref(shared_fr),
-                      std::ref(vitals_ready));
+                      std::ref(vitals_ready),
+                      std::ref(telemetry));
 
     std::cout << "[MAIN]   All threads launched. Press Ctrl+C to stop.\n"
               << std::endl;
@@ -480,6 +556,9 @@ int main()
     roi_queue.shutdown();      // Ensure DSP thread wakes up.
 
     if (t_dsp.joinable()) t_dsp.join();
+
+    // Flush remaining telemetry to disk once all producers have stopped.
+    telemetry.stop();
 
     std::cout << "\n[MAIN]   All threads joined. Shutdown complete." << std::endl;
 
