@@ -15,6 +15,7 @@
 #include "extraction/PosExtractor.hpp"
 #include "estimation/estimation.hpp"
 #include "streaming/MjpegStreamer.hpp"
+#include "logging/SessionLogger.hpp"
 
 #include <opencv2/videoio.hpp>
 #include <opencv2/core.hpp>
@@ -152,6 +153,9 @@ namespace cfg {
 
     // Console statistics interval (frames)
     constexpr int kStatsInterval = 30;
+
+    // Field-test session recordings (relative to the working directory)
+    constexpr char kSessionDir[] = "sessions";
 }
 
 // ----------------------------------------------------------------------------
@@ -229,6 +233,7 @@ static void captureThread(BoundedQueue<cv::Mat>& capture_queue)
  * @param shared_hr        Atomic HR value published by the DSP thread.
  * @param shared_fr        Atomic FR value published by the DSP thread.
  * @param vitals_ready     Atomic flag: true once the estimator is calibrated.
+ * @param logger           Session recorder (FPS / latency stats + tracking events).
  */
 static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
                             BoundedQueue<cv::Mat>& roi_queue,
@@ -239,7 +244,8 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
                             MjpegStreamer&          streamer,
                             std::atomic<double>&   shared_hr,
                             std::atomic<double>&   shared_fr,
-                            std::atomic<bool>&     vitals_ready)
+                            std::atomic<bool>&     vitals_ready,
+                            SessionLogger&         logger)
 {
     // Initialise the NPU-accelerated detector.
     FaceDetectorSCRFD detector(cfg::kHefPath, cfg::kScoreThreshold);
@@ -274,6 +280,9 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
             std::chrono::duration<double>(t_done - t_start).count();
         const double fps = (elapsed_s > 0.0) ? frame_count / elapsed_s : 0.0;
 
+        // Make the latest stats available to the session recorder.
+        logger.updateDetectionStats(fps, latency_ms);
+
         // Stream the composed frame BEFORE destroying the original. 
         FrameInfo fi;
         fi.detected     = detected;
@@ -291,6 +300,9 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
         frame.release();
 
         if (detected) {
+            if (!was_tracking) {
+                logger.logEvent("tracking_acquired");
+            }
             was_tracking = true;
             // Forward the ROI (clone to decouple from detector internals).
             roi_queue.push(roi.clone());
@@ -302,6 +314,7 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
                 pos_extractor.reset();
                 estimator.reset();
                 vitals_ready.store(false, std::memory_order_relaxed);
+                logger.logEvent("tracking_lost");
                 std::cout << "[DETECT]  Tracking lost - downstream modules reset."
                           << std::endl;
             }
@@ -344,6 +357,7 @@ static void detectionThread(BoundedQueue<cv::Mat>& capture_queue,
  * @param shared_hr     Atomic HR output for the streamer overlay.
  * @param shared_fr     Atomic FR output for the streamer overlay.
  * @param vitals_ready  Atomic flag set once estimation is calibrated.
+ * @param logger        Session recorder (one record per estimator update).
  */
 static void dspThread(BoundedQueue<cv::Mat>& roi_queue,
                       Anonymizer&            anonymizer,
@@ -352,7 +366,8 @@ static void dspThread(BoundedQueue<cv::Mat>& roi_queue,
                       std::mutex&            dsp_mutex,
                       std::atomic<double>&   shared_hr,
                       std::atomic<double>&   shared_fr,
-                      std::atomic<bool>&     vitals_ready)
+                      std::atomic<bool>&     vitals_ready,
+                      SessionLogger&         logger)
 {
     std::cout << "[DSP]    Processing thread started." << std::endl;
 
@@ -392,6 +407,9 @@ static void dspThread(BoundedQueue<cv::Mat>& roi_queue,
             shared_fr.store(fr_rpm, std::memory_order_relaxed);
             vitals_ready.store(true, std::memory_order_relaxed);
 
+            // Persist the reading for the field-test session.
+            logger.logVitals(hr_bpm, fr_rpm);
+
             std::cout << std::fixed << std::setprecision(1)
                       << "[VITALS] HR: " << hr_bpm << " BPM"
                       << " | FR: " << fr_rpm << " RPM"
@@ -408,17 +426,28 @@ static void dspThread(BoundedQueue<cv::Mat>& roi_queue,
 
 int main()
 {
-    // Register signal handlers for graceful shutdown.
-    std::signal(SIGINT,  signalHandler);
-    std::signal(SIGTERM, signalHandler);
-    std::signal(SIGPIPE, SIG_IGN);  // Prevent crash on broken client socket.
-
     std::cout
         << "============================================================\n"
         << "  PRIVES - Privacy-Preserving Vital Signs Monitor\n"
         << "  Pipeline: Capture -> Detection -> Anonymize -> POS -> Est.\n"
         << "============================================================\n"
         << std::endl;
+
+    // Field-test session recorder. The name is requested BEFORE installing
+    // the signal handlers so Ctrl+C at the prompt still aborts immediately.
+    SessionLogger logger;
+    const std::string subject = SessionLogger::promptSubjectName(std::cin, std::cout);
+    if (!logger.open(subject, cfg::kSessionDir)) {
+        std::cerr << "[LOGGER] ERROR: could not create session file. Aborting."
+                  << std::endl;
+        return 1;
+    }
+    std::cout << "[LOGGER] Recording to: " << logger.csvPath() << "\n" << std::endl;
+
+    // Register signal handlers for graceful shutdown.
+    std::signal(SIGINT,  signalHandler);
+    std::signal(SIGTERM, signalHandler);
+    std::signal(SIGPIPE, SIG_IGN);  // Prevent crash on broken client socket.
 
     // Shared modules (owned by main, referenced by threads).
     Anonymizer   anonymizer;
@@ -453,7 +482,8 @@ int main()
                          std::ref(streamer),
                          std::ref(shared_hr),
                          std::ref(shared_fr),
-                         std::ref(vitals_ready));
+                         std::ref(vitals_ready),
+                         std::ref(logger));
 
     std::thread t_dsp(dspThread,
                       std::ref(roi_queue),
@@ -463,7 +493,8 @@ int main()
                       std::ref(dsp_mutex),
                       std::ref(shared_hr),
                       std::ref(shared_fr),
-                      std::ref(vitals_ready));
+                      std::ref(vitals_ready),
+                      std::ref(logger));
 
     std::cout << "[MAIN]   All threads launched. Press Ctrl+C to stop.\n"
               << std::endl;
@@ -480,6 +511,13 @@ int main()
     roi_queue.shutdown();      // Ensure DSP thread wakes up.
 
     if (t_dsp.joinable()) t_dsp.join();
+
+    // Close the session CSV file.
+    const std::size_t n_vitals = logger.vitalsCount();
+    const std::string csv_out  = logger.csvPath();
+    logger.close();
+    std::cout << "\n[LOGGER] Session saved: " << csv_out
+              << " (" << n_vitals << " vital-sign readings)." << std::endl;
 
     std::cout << "\n[MAIN]   All threads joined. Shutdown complete." << std::endl;
 
