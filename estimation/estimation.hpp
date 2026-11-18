@@ -79,6 +79,21 @@ public:
      */
     bool isReady() const;
 
+    /**
+     * @brief Returns true once the HR pipeline has passed its calibration threshold (kHrCalibSamples).
+     */
+    bool isHrReady() const noexcept;
+
+    /**
+     * @brief Returns the most recent cardiac-band IIR-filtered PPG sample produced by process_sample().
+     */
+    double lastHrFiltered() const noexcept;
+
+    /**
+     * @brief Returns the most recent respiratory-band IIR-filtered sample produced by process_sample().
+     */
+    double lastFrFiltered() const noexcept;
+
 private:
     // IIR bandpass filters (Butterworth, 4th-order)
     static constexpr int kFilterOrder = 4;
@@ -108,6 +123,8 @@ private:
     // Counters 
     int m_total_samples;          // Total ingested samples (monotonic)
     int m_update_counter;         // Counts 0..29 then wraps (1 s trigger)
+    double m_last_hr_filtered;    // Most recent cardiac-band IIR-filtered sample
+    double m_last_fr_filtered;    // Most recent respiratory-band IIR-filtered sample
 
     // Internal helpers
     /**

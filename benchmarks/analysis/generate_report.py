@@ -465,10 +465,10 @@ def plot_latency_breakdown(scenario: Scenario, path: Path) -> None:
     ax.axhline(FRAME_PERIOD_MS, color="#edae49", ls="-.", lw=1.2, label="Presupuesto 30 FPS (33.33 ms)")
     ax.set_xlabel("Tiempo (min)")
     ax.set_ylabel("Latencia media por segundo (ms)")
-    ax.set_title(f"Descomposición de latencia por etapa — {scenario.label}")
+    ax.set_title(f"Descomposición de latencia por etapa — {scenario.label}", pad=30)
     ax.set_xlim(minutes.min(), minutes.max())
     ax.set_ylim(0, max(FRAME_PERIOD_MS * 1.2, float(binned["t_total_ms"].max()) * 1.1))
-    ax.legend(loc="upper left", fontsize=7, ncol=2, frameon=True)
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.02), fontsize=7, ncol=4, frameon=False)
     _save(fig, path)
 
 
@@ -504,8 +504,8 @@ def plot_memory_stability(scenario: Scenario, path: Path) -> None:
     ax.set_ylim(max(0.0, data["ram_rss_mb"].min() - margin), upper)
     ax.set_xlabel("Tiempo (min)")
     ax.set_ylabel("RSS (MB)")
-    ax.set_title(f"Estabilidad de memoria — {scenario.label}")
-    ax.legend(loc="lower right", fontsize=7)
+    ax.set_title(f"Estabilidad de memoria — {scenario.label}", pad=30)
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.02), fontsize=7, ncol=3, frameon=False)
     _save(fig, path)
 
 
@@ -548,11 +548,11 @@ def plot_thermal_power(scenario: Scenario, path: Path) -> None:
     ax_t.tick_params(axis="y", colors=temp_color)
     ax_p.tick_params(axis="y", colors=power_color)
     ax_p.grid(False)
-    ax_t.set_title(f"Perfil térmico y de potencia — {scenario.label}")
+    ax_t.set_title(f"Perfil térmico y de potencia — {scenario.label}", pad=30)
     handles = ax_t.get_legend_handles_labels()
     handles_p = ax_p.get_legend_handles_labels()
-    ax_t.legend(handles[0] + handles_p[0], handles[1] + handles_p[1], loc="lower right",
-                fontsize=7, ncol=2)
+    ax_t.legend(handles[0] + handles_p[0], handles[1] + handles_p[1], loc="lower center", bbox_to_anchor=(0.5, 1.02),
+                fontsize=7, ncol=3, frameon=False)
     _save(fig, path)
 
 

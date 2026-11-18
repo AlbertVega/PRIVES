@@ -15,6 +15,8 @@ estimation::estimation()
     , m_fr_fft_out(nullptr)
     , m_total_samples(0)
     , m_update_counter(0)
+    , m_last_hr_filtered(0.0)
+    , m_last_fr_filtered(0.0)
 {
     // Configure IIR bandpass filters
     // Iir1 BandPass::setup(samplingRate, centerFrequency, widthFrequency)
@@ -75,6 +77,9 @@ bool estimation::process_sample(double bvp_sample, double& hr_bpm, double& fr_rp
     }
 
     // Store in respective circular buffers
+    m_last_hr_filtered = hr_filtered;
+    m_last_fr_filtered = fr_filtered;
+
     m_hr_buf[m_hr_head] = hr_filtered;
     m_hr_head = (m_hr_head + 1) % kHrBufLen;
 
@@ -126,7 +131,24 @@ void estimation::reset()
 
     // Reset counters
     m_total_samples  = 0;
+    m_last_hr_filtered = 0.0;
+    m_last_fr_filtered = 0.0;
     m_update_counter = 0;
+}
+
+bool estimation::isHrReady() const noexcept
+{
+    return (m_total_samples >= kHrCalibSamples);
+}
+
+double estimation::lastHrFiltered() const noexcept
+{
+    return m_last_hr_filtered;
+}
+
+double estimation::lastFrFiltered() const noexcept
+{
+    return m_last_fr_filtered;
 }
 
 bool estimation::isReady() const

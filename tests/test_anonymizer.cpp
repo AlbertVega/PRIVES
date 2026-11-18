@@ -5,7 +5,12 @@
 #include "../anonymizer/Anonymizer.hpp"
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/objdetect.hpp>
 #include <cmath>
+#include <filesystem>
+#include <iostream>
+#include <string>
 
 using Catch::Matchers::WithinAbs;
 
@@ -183,4 +188,111 @@ TEST_CASE("Anonymizer works with different macroblock sizes", "[anonymizer][macr
     for (int c = 0; c < 3; ++c) {
         REQUIRE_THAT(m_anon[c], WithinAbs(m_orig[c], 1.5));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Facial de-identification (ArcFace / SFace via cv::FaceRecognizerSF)
+// ---------------------------------------------------------------------------
+static std::string resolveAssetPath(const std::string& filename)
+{
+    namespace fs = std::filesystem;
+    const std::string candidates[] = {
+        "build/" + filename,
+        filename,
+        "../build/" + filename,
+        "tests/" + filename,
+        "../tests/" + filename
+    };
+    for (const auto& path : candidates) {
+        if (fs::exists(path)) {
+            return path;
+        }
+    }
+    return "";
+}
+
+TEST_CASE("Anonymizer prevents facial re-identification under SFace/ArcFace", "[anonymizer][deidentification]")
+{
+    constexpr int kNumFaces = 10;
+    const std::string model_path = resolveAssetPath("face_recognition_sface_2021dec.onnx");
+
+    if (model_path.empty() || resolveAssetPath("face1.jpg").empty()) {
+        SKIP("Skipping SFace de-identification test: face1..10.jpg or face_recognition_sface_2021dec.onnx not found");
+    }
+
+    // Load OpenCV SFace (ArcFace-based) recognizer once
+    cv::Ptr<cv::FaceRecognizerSF> recognizer = cv::FaceRecognizerSF::create(model_path, "");
+    REQUIRE(recognizer != nullptr);
+
+    constexpr double kCosineThreshold = 0.363;
+    constexpr double kNormL2Threshold = 1.128;
+
+    double sum_cosine = 0.0;
+    double sum_l2     = 0.0;
+
+    std::cout << "\n=== [SFace De-ID] Evaluating " << kNumFaces << " face ROIs (128x176) ===" << std::endl;
+
+    for (int i = 1; i <= kNumFaces; ++i) {
+        const std::string filename  = "face" + std::to_string(i) + ".jpg";
+        const std::string face_path = resolveAssetPath(filename);
+        INFO("Testing image: " << filename);
+        REQUIRE_FALSE(face_path.empty());
+
+        const cv::Mat orig_face = cv::imread(face_path, cv::IMREAD_COLOR);
+        REQUIRE_FALSE(orig_face.empty());
+        REQUIRE(orig_face.type() == CV_8UC3);
+        REQUIRE(orig_face.cols == 128);
+        REQUIRE(orig_face.rows == 176);
+
+        // Obtain anonymized ROI through Anonymizer (fresh calibration per subject)
+        Anonymizer anon(16);
+        const cv::Mat anon_face = anon.processFrame(orig_face);
+        REQUIRE_FALSE(anon_face.empty());
+        REQUIRE(anon_face.size() == orig_face.size());
+
+        // SFace expects 112x112 aligned/cropped face inputs
+        cv::Mat orig_aligned, anon_aligned;
+        cv::resize(orig_face, orig_aligned, cv::Size(112, 112));
+        cv::resize(anon_face, anon_aligned, cv::Size(112, 112));
+
+        cv::Mat e_orig, e_anon;
+        recognizer->feature(orig_aligned, e_orig);
+        e_orig = e_orig.clone();
+        recognizer->feature(anon_aligned, e_anon);
+        e_anon = e_anon.clone();
+
+        // Sanity check: comparing original face against itself must yield ~1.0 cosine similarity
+        const double self_score = recognizer->match(e_orig, e_orig, cv::FaceRecognizerSF::DisType::FR_COSINE);
+        REQUIRE_THAT(self_score, WithinAbs(1.0, 1e-4));
+
+        // Compute de-identification metrics
+        const double cosine_score = recognizer->match(e_orig, e_anon, cv::FaceRecognizerSF::DisType::FR_COSINE);
+        const double l2_distance  = recognizer->match(e_orig, e_anon, cv::FaceRecognizerSF::DisType::FR_NORM_L2);
+
+        sum_cosine += cosine_score;
+        sum_l2     += l2_distance;
+
+        std::cout << "  [" << filename << "] Cosine similarity (orig vs anon): " << cosine_score
+                  << " | L2 distance (orig vs anon): " << l2_distance << std::endl;
+
+        INFO("Cosine similarity for " << filename << ": " << cosine_score);
+        INFO("L2 distance for " << filename << ": " << l2_distance);
+
+        REQUIRE(cosine_score < kCosineThreshold);
+        REQUIRE(l2_distance > kNormL2Threshold);
+    }
+
+    const double avg_cosine = sum_cosine / static_cast<double>(kNumFaces);
+    const double avg_l2     = sum_l2 / static_cast<double>(kNumFaces);
+
+    std::cout << "-------------------------------------------------------------------\n"
+              << "[SFace De-ID Average (" << kNumFaces << " faces)]\n"
+              << "  Average Cosine similarity (orig vs anon): " << avg_cosine
+              << " (threshold >= " << kCosineThreshold << " for same identity)\n"
+              << "  Average L2 distance       (orig vs anon): " << avg_l2
+              << " (threshold <= " << kNormL2Threshold << " for same identity)\n"
+              << "===================================================================\n" << std::endl;
+
+    REQUIRE(avg_cosine < kCosineThreshold);
+    REQUIRE(avg_l2 > kNormL2Threshold);
 }
